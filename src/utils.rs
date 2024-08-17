@@ -16,6 +16,11 @@ use std::{
 use std::{panic, process::Child};
 use walkdir::WalkDir;
 
+const FIESTA_TOTAL_CONTRACTS: usize = 150_000;
+const DEFAULT_NUM_CONTRACTS: usize = 1000;
+const DEFAULT_TIMEOUT_SECS: f64 = 1.0;
+
+
 lazy_static! {
     /// Thread panic, but is Todo based
     static ref TODO_ERROR_REGEX: Regex =
@@ -44,7 +49,6 @@ lazy_static! {
         Regex::new(r"DONE ANALYZING IN: \d+ms\. Writing to cli\.\.\.\n$").unwrap();
 }
 
-const FIESTA_TOTAL_CONTRACTS: usize = 150_000;
 
 pub fn collect_fiesta_metadatas(
     abs_fiesta_path: &Path,
@@ -313,8 +317,9 @@ pub fn get_output_path(output: Option<String>) -> PathBuf {
     }
 }
 
-pub fn get_timeouts(timeout: Option<f64>) -> (f64, f64) {
-    match timeout {
+/// First return value is pyrometer per-run timeout, second return value is rx_loop waiting period before early-exiting
+pub fn get_timeouts(timeout_secs: Option<f64>) -> (f64, f64) {
+    match timeout_secs {
         Some(timeout) => {
             if timeout == 0.0 {
                 (1_000_000.0, 1_000_000.0)
@@ -322,7 +327,7 @@ pub fn get_timeouts(timeout: Option<f64>) -> (f64, f64) {
                 (timeout, timeout + 1.0)
             }
         }
-        None => (2.0, 3.0),
+        None => (DEFAULT_TIMEOUT_SECS, DEFAULT_TIMEOUT_SECS + 1.0),
     }
 }
 
@@ -335,6 +340,6 @@ pub fn get_num_contracts(num_contracts: Option<usize>) -> usize {
                 num_contracts
             }
         }
-        None => 500,
+        None => DEFAULT_NUM_CONTRACTS,
     }
 }

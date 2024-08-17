@@ -17,7 +17,7 @@ Next, ensure you have pyrometer [installed](https://github.com/nascentxyz/pyrome
 
 Then, run as so:
 ```bash
-# default run is 5000 contracts, output goes to ./data/results_<timestamp>.csv, all cpu cores used, 2s timeout.
+# default run is 1000 contracts, output goes to ./data/results_<timestamp>.csv, all cpu cores used, 1s timeout.
 cargo run --release -- <path/to/smart-contract-fiesta>
 
 # Configured to run 145000 contracts, 4 cpu cores used, 5s timeout.
@@ -32,10 +32,10 @@ Arguments:
   <PATH>  Path to the smart-contract-fiesta root directory
 
 Options:
-  -n, --num-contracts <NUM_CONTRACTS>
-          The number of contracts to run pyrometer on. Default is 5000 If set to 0, all contracts will be analyzed
+  -n, --num <NUM_CONTRACTS>
+          The number of contracts to run pyrometer on. Default is 1000. If set to 0, all contracts will be analyzed
   -t, --timeout <TIMEOUT>
-          Timeout for each pyrometer process (secs). Default is 2 seconds, decimals supported. If set to 0, there will be no timeout. Not advised
+          Timeout for each pyrometer process (secs). Default is 1 second. decimals supported. If set to 0, there will be no timeout. (Not advised)
   -o, --output <OUTPUT>
           Where to save the results file, default is "./data/results_MM-DD_HH-MM.csv"
   -j, --jobs <JOBS>
