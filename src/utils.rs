@@ -160,15 +160,14 @@ fn collect_contract_sources(metadata: &mut FiestaMetadata) {
     }
 }
 
-pub fn analyze_with_pyrometer(metadata: &FiestaMetadata) -> (Child, u64) {
+pub fn analyze_with_pyrometer(metadata: &FiestaMetadata, pyrometer_bin: &PathBuf) -> (Child, u64) {
     match metadata.clone().source_type.unwrap() {
         SourceType::SingleMain(_sol) => {
             let path_to_file = PathBuf::from(metadata.abs_path_to_dir.clone()).join("main.sol");
-            // reformat path_to_file as a string
             let path_to_file = path_to_file.to_str().unwrap();
             let size = fs::metadata(path_to_file).unwrap().len();
 
-            let child = Command::new("pyrometer")
+            let child = Command::new(&pyrometer_bin)
                 .args([path_to_file, "--debug", "--debug-panic"])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -185,7 +184,7 @@ pub fn analyze_with_pyrometer(metadata: &FiestaMetadata) -> (Child, u64) {
                     let path_to_file = path_to_file.to_str().unwrap();
                     let size = fs::metadata(path_to_file).unwrap().len();
 
-                    let child = Command::new("pyrometer")
+                    let child = Command::new(&pyrometer_bin)
                         .args([path_to_file, "--debug"])
                         .stdout(Stdio::piped())
                         .stderr(Stdio::piped())
@@ -205,7 +204,7 @@ pub fn analyze_with_pyrometer(metadata: &FiestaMetadata) -> (Child, u64) {
                 PathBuf::from(metadata.abs_path_to_dir.clone()).join("contract.json");
             let path_to_file = path_to_file.to_str().unwrap();
             let size = fs::metadata(path_to_file).unwrap().len();
-            let child = Command::new("pyrometer")
+            let child = Command::new(&pyrometer_bin)
                 .args([path_to_file, "--debug"])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -342,4 +341,25 @@ pub fn get_num_contracts(num_contracts: Option<usize>) -> usize {
         }
         None => DEFAULT_NUM_CONTRACTS,
     }
+}
+
+pub fn build_pyrometer(pyrometer_manifest: &PathBuf) -> PathBuf {
+    let manifest_dir = pyrometer_manifest.parent().expect("Invalid manifest path");
+    
+    let status = Command::new("cargo")
+        .current_dir(manifest_dir)
+        .args(["build", "--release"])
+        .status()
+        .expect("Failed to build Pyrometer");
+
+    if !status.success() {
+        panic!("Failed to build Pyrometer");
+    }
+
+    pyrometer_manifest
+        .parent()
+        .unwrap()
+        .join("target")
+        .join("release")
+        .join("pyrometer")
 }

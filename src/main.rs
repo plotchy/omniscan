@@ -18,6 +18,8 @@ use utils::{
     display_result_distribution, get_num_contracts, get_output_path, get_timeouts,
 };
 
+use crate::utils::build_pyrometer;
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 pub struct Args {
@@ -47,10 +49,15 @@ pub struct Args {
     /// This is intended for debugging purposes
     #[clap(long, short)]
     pub skip_contracts: Option<usize>,
+
+    /// Path to the Pyrometer project's Cargo.toml. ie: `../pyrometer/Cargo.toml`
+    #[clap(long, value_name = "PYROMETER_PATH")]
+    pub pyrometer_manifest: PathBuf,
 }
 
 fn main() {
     let args = Args::parse();
+    let pyrometer_bin = build_pyrometer(&args.pyrometer_manifest);
     let abs_fiesta_path = std::path::PathBuf::from(args.path.clone());
 
     if !abs_fiesta_path.exists() && !abs_fiesta_path.is_dir() {
@@ -68,7 +75,7 @@ fn main() {
         collect_fiesta_metadatas(&abs_fiesta_path, num_contracts, skip_contracts);
 
     let total_contracts = fiesta_metadatas.len();
-    println!("📚 Beginning analysis of {} contracts", total_contracts);
+    println!("📚 Beginning analysis of {} contracts with {:.1}s timeout", total_contracts, pyrometer_timeout);
     println!("💡 Press Ctrl-C to exit analysis early anytime");
 
     let early_exit = Arc::new(AtomicBool::new(false));
@@ -81,7 +88,7 @@ fn main() {
     let runtime = Runtime::new().unwrap();
     let handle = runtime.handle().clone();
 
-    // Spawn the signal handler task
+    // Spawn the early-exit handler task
     handle.spawn(async move {
         match signal::ctrl_c().await {
             Ok(()) => {
@@ -112,6 +119,7 @@ fn main() {
             tx,
             stop_tx,
             jobs.into(),
+            &pyrometer_bin,
             pyrometer_timeout,
             early_exit_clone_tx,
         )
@@ -123,7 +131,7 @@ fn main() {
 
     // Shut down the runtime
     drop(handle);
-    runtime.shutdown_timeout(Duration::from_secs(5));
+    runtime.shutdown_timeout(Duration::from_secs(2));
 
     if let Ok(result_distribution) = rx_result {
         display_result_distribution(result_distribution.0, result_distribution.1);
@@ -135,6 +143,7 @@ pub async fn tx_loop(
     tx_result: mpsc::Sender<ResultMessage>,
     tx_stop: oneshot::Sender<()>,
     max_concurrent_processes: usize,
+    pyrometer_bin: &PathBuf,
     pyrometer_timeout: f64,
     early_exit: Arc<AtomicBool>,
 ) {
@@ -150,9 +159,9 @@ pub async fn tx_loop(
         let tx = tx_result.clone();
         let semaphore = semaphore.clone();
         let permit = semaphore.acquire_owned().await;
-
+        let pyrometer_bin_clone = pyrometer_bin.clone();
         let join_handle = tokio::spawn(async move {
-            let (mut child, size) = analyze_with_pyrometer(&metadata);
+            let (mut child, size) = analyze_with_pyrometer(&metadata, &pyrometer_bin_clone);
 
             let start_time = std::time::Instant::now();
             loop {
