@@ -1,11 +1,11 @@
 use crate::{
-    data_structures::{ExitType, SourceType},
+    data_structures::{ExitType, ResultMessage, SourceType},
     FiestaMetadata,
 };
 use ethers::etherscan::contract::SourceCodeMetadata;
 use indicatif::{ProgressBar, ProgressStyle};
 use lazy_static::lazy_static;
-use prettytable::{Cell, Row, Table};
+use prettytable::{Attr, Cell, Row, Table};
 use regex::Regex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -15,6 +15,7 @@ use std::{
 };
 use std::{panic, process::Child};
 use walkdir::WalkDir;
+use prettytable::color;
 
 const FIESTA_TOTAL_CONTRACTS: usize = 150_000;
 const DEFAULT_NUM_CONTRACTS: usize = 1000;
@@ -270,12 +271,12 @@ fn convert_pyrometer_output_to_exit_type(stdout_string: String, stderr_string: S
     ExitType::NonInterpreted(stdout_string, stderr_string)
 }
 
-pub fn display_result_distribution(distribution: HashMap<String, usize>, total: usize) {
+pub fn display_result_distribution(distribution: HashMap<ExitType, usize>, total: usize, smallest_sources: HashMap<ExitType, ResultMessage>) {
     let mut table = Table::new();
     table.add_row(Row::new(vec![
-        Cell::new("Result Type"),
-        Cell::new("Count"),
-        Cell::new("Percentage"),
+        Cell::new("Result Type").style_spec("bFc"),
+        Cell::new("Count").style_spec("bFy"),
+        Cell::new("Percentage").style_spec("bFg"),
     ]));
 
     let mut sorted_distribution: Vec<_> = distribution.into_iter().collect();
@@ -283,14 +284,63 @@ pub fn display_result_distribution(distribution: HashMap<String, usize>, total: 
 
     for (result_type, count) in sorted_distribution {
         let percentage = (count as f64 / total as f64) * 100.0;
+        let percentage_str = format!("{:.2}%", percentage);
+
+        let smallest_source = smallest_sources.get(&result_type)
+            .map(|msg| get_path_str_for_result_message(&msg))
+            .unwrap_or_else(|| "N/A".to_string());
+        
+        let result_type_str = result_type.to_string();
+        let result_type_str_with_source = format!("{}\n{}", result_type_str, smallest_source);
+
+        let result_type_cell = Cell::new(&result_type_str_with_source)
+            .with_style(Attr::ForegroundColor(color::CYAN));
+
+        let count_cell = Cell::new(&count.to_string()).style_spec("Fy");
+        let percentage_cell = Cell::new(&percentage_str).style_spec("Fg");
+
         table.add_row(Row::new(vec![
-            Cell::new(&result_type),
-            Cell::new(&count.to_string()),
-            Cell::new(&format!("{:.2}%", percentage)),
+            result_type_cell,
+            count_cell,
+            percentage_cell,
         ]));
     }
 
     table.printstd();
+}
+
+fn get_path_str_for_result_message(result_message: &ResultMessage) -> String {
+
+    let metadata = &result_message.metadata;
+
+    if let Some(source_type) = metadata.source_type.as_ref() {
+        // have a source type, determine file path differently for each
+        match source_type {
+            SourceType::SingleMain(_sol) => {
+                let path = PathBuf::from(metadata.abs_path_to_dir.clone()).join("main.sol");
+                return path.to_str().unwrap().to_string();
+            },
+            SourceType::Multiple(multiple_files) => {
+                let substr_to_find = format!("contract {} ", metadata.contract_name);
+                for (name, sol_string) in multiple_files {
+                    if sol_string.contains(&substr_to_find) {
+                        let path = PathBuf::from(metadata.abs_path_to_dir.clone()).join(name);
+                        return path.to_str().unwrap().to_string();
+                    }
+                }
+                // if we get here, we didn't find the contract name in any of the files
+                return "N/A".to_string()
+            },
+            SourceType::EtherscanMetadata(_source_metadata) => {
+                let path = PathBuf::from(metadata.abs_path_to_dir.clone()).join("contract.json");
+                return path.to_str().unwrap().to_string();
+            }
+        }
+    } else {
+        // SourceType not found.. how? just return the path to the directory
+        return metadata.abs_path_to_dir.clone()
+    }
+
 }
 
 pub fn get_output_path(output: Option<String>) -> PathBuf {
@@ -344,10 +394,14 @@ pub fn get_num_contracts(num_contracts: Option<usize>) -> usize {
 }
 
 pub fn build_pyrometer(pyrometer_manifest: &PathBuf) -> PathBuf {
-    let manifest_dir = pyrometer_manifest.parent().expect("Invalid manifest path");
-    
+    let manifest_dir = pyrometer_manifest
+        .parent()
+        .expect("Invalid manifest path")
+        .canonicalize()
+        .expect("Failed to canonicalize manifest directory");
+
     let status = Command::new("cargo")
-        .current_dir(manifest_dir)
+        .current_dir(&manifest_dir)
         .args(["build", "--release"])
         .status()
         .expect("Failed to build Pyrometer");
@@ -356,9 +410,7 @@ pub fn build_pyrometer(pyrometer_manifest: &PathBuf) -> PathBuf {
         panic!("Failed to build Pyrometer");
     }
 
-    pyrometer_manifest
-        .parent()
-        .unwrap()
+    manifest_dir
         .join("target")
         .join("release")
         .join("pyrometer")

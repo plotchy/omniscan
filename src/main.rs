@@ -12,7 +12,7 @@ use tokio::sync::{oneshot, Semaphore};
 mod data_structures;
 mod utils;
 
-use data_structures::{ExitType, FiestaMetadata, ResultMessage, ResultsWriter};
+use data_structures::{ExitType, FiestaMetadata, ResultMessage, ResultsWriter, SourceType};
 use utils::{
     analyze_with_pyrometer, check_child_exit, collect_fiesta_metadatas,
     display_result_distribution, get_num_contracts, get_output_path, get_timeouts,
@@ -23,6 +23,10 @@ use crate::utils::build_pyrometer;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 pub struct Args {
+    /// Path to the Pyrometer project's Cargo.toml. ie: `../pyrometer/Cargo.toml`
+    #[clap(long, value_name = "PYROMETER_PATH")]
+    pub pyrometer_manifest_path: PathBuf,
+
     /// Path to the smart-contract-fiesta root directory
     #[clap(value_hint = ValueHint::FilePath, value_name = "PATH")]
     pub path: String,
@@ -50,14 +54,12 @@ pub struct Args {
     #[clap(long, short)]
     pub skip_contracts: Option<usize>,
 
-    /// Path to the Pyrometer project's Cargo.toml. ie: `../pyrometer/Cargo.toml`
-    #[clap(long, value_name = "PYROMETER_PATH")]
-    pub pyrometer_manifest: PathBuf,
+
 }
 
 fn main() {
     let args = Args::parse();
-    let pyrometer_bin = build_pyrometer(&args.pyrometer_manifest);
+    let pyrometer_bin = build_pyrometer(&args.pyrometer_manifest_path);
     let abs_fiesta_path = std::path::PathBuf::from(args.path.clone());
 
     if !abs_fiesta_path.exists() && !abs_fiesta_path.is_dir() {
@@ -134,7 +136,7 @@ fn main() {
     runtime.shutdown_timeout(Duration::from_secs(2));
 
     if let Ok(result_distribution) = rx_result {
-        display_result_distribution(result_distribution.0, result_distribution.1);
+        display_result_distribution(result_distribution.0, result_distribution.1, result_distribution.2);
     }
 }
 
@@ -217,7 +219,7 @@ pub async fn rx_loop(
     rx_loop_timeout: f64,
     total_contracts: usize,
     early_exit: Arc<AtomicBool>,
-) -> (HashMap<std::string::String, usize>, usize) {
+) -> (HashMap<ExitType, usize>, usize, HashMap<ExitType, ResultMessage>) {
     let results_writer = ResultsWriter { output_path };
     results_writer.initiate_headers_for_results_csv();
 
@@ -225,6 +227,7 @@ pub async fn rx_loop(
     let mut parse_count = 0;
     let mut total_parsable = 0;
     let mut result_distribution = HashMap::new();
+    let mut smallest_results = HashMap::new();
 
     let pb = ProgressBar::new(total_contracts as u64);
     pb.set_style(ProgressStyle::default_bar()
@@ -242,12 +245,13 @@ pub async fn rx_loop(
                 break;
             }
             Err(_) => match rx_result.recv_timeout(rx_loop_timeout) {
-                Ok(result_message) => {
+                Ok(mut result_message) => {
                     let exit_type = if let Some(child) = result_message.child {
                         check_child_exit(child)
                     } else {
                         ExitType::PerformanceTimeout
                     };
+                    result_message.child = None; // We're done with .child, just set it to None so we can clone and stuff without partial borrows from above
 
                     results_writer.append_to_results_file(
                         &result_message.metadata,
@@ -261,8 +265,33 @@ pub async fn rx_loop(
 
                     total_parsable += 1;
                     *result_distribution
-                        .entry(exit_type.to_string())
+                        .entry(exit_type.clone())
                         .or_insert(0) += 1;
+
+                    // Update smallest result for each ExitType, prioritizing SingleMain > Multiple > EtherscanMetadata source types.
+                    smallest_results
+                        .entry(exit_type.clone())
+                        .and_modify(|e: &mut ResultMessage| {
+                            let current_priority = match e.metadata.source_type {
+                                Some(SourceType::SingleMain(_)) => 0,
+                                Some(SourceType::Multiple(_)) => 1,
+                                Some(SourceType::EtherscanMetadata(_)) => 2,
+                                None => 3,
+                            };
+
+                            let new_priority = match result_message.metadata.source_type {
+                                Some(SourceType::SingleMain(_)) => 0,
+                                Some(SourceType::Multiple(_)) => 1,
+                                Some(SourceType::EtherscanMetadata(_)) => 2,
+                                None => 3,
+                            };
+
+                            if new_priority < current_priority || 
+                               (new_priority == current_priority && result_message.size < e.size) {
+                                *e = result_message.clone();
+                            }
+                        })
+                        .or_insert_with(|| result_message.clone());
 
                     pb.inc(1);
 
@@ -281,5 +310,5 @@ pub async fn rx_loop(
             },
         }
     }
-    (result_distribution, total_parsable)
+    (result_distribution, total_parsable, smallest_results)
 }

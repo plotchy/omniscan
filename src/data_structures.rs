@@ -51,6 +51,7 @@ impl FiestaMetadata {
     }
 }
 
+#[derive(Debug)]
 pub struct ResultMessage {
     pub metadata: FiestaMetadata,
     pub child: Option<Child>,
@@ -58,7 +59,18 @@ pub struct ResultMessage {
     pub size: u64,
 }
 
-#[derive(Clone, Debug)]
+impl Clone for ResultMessage {
+    fn clone(&self) -> Self {
+        ResultMessage {
+            metadata: self.metadata.clone(),
+            child: None, // Ignore the child field
+            time: self.time,
+            size: self.size,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ExitType {
     Success,
     PerformanceTimeout,
