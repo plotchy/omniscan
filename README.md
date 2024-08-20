@@ -44,6 +44,8 @@ Options:
           The number of concurrent processes to use for the analysis. Default is the number of cores
   -s, --skip-contracts <SKIP_CONTRACTS>
           The number of contracts to initially skip over. Default is 0. This is intended for debugging purposes
+      --minimize-path <MINIMIZE_PATH>
+          Output path for minimized contracts. Recommended is `./tmp`
   -h, --help
           Print help
   -V, --version
