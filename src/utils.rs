@@ -186,7 +186,7 @@ pub fn analyze_with_pyrometer(metadata: &FiestaMetadata, pyrometer_bin: &PathBuf
                     let size = fs::metadata(path_to_file).unwrap().len();
 
                     let child = Command::new(&pyrometer_bin)
-                        .args([path_to_file, "--debug"])
+                        .args([path_to_file, "--debug", "--debug-panic"])
                         .stdout(Stdio::piped())
                         .stderr(Stdio::piped())
                         .spawn()
@@ -206,7 +206,7 @@ pub fn analyze_with_pyrometer(metadata: &FiestaMetadata, pyrometer_bin: &PathBuf
             let path_to_file = path_to_file.to_str().unwrap();
             let size = fs::metadata(path_to_file).unwrap().len();
             let child = Command::new(&pyrometer_bin)
-                .args([path_to_file, "--debug"])
+                .args([path_to_file, "--debug", "--debug-panic"])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
@@ -216,6 +216,71 @@ pub fn analyze_with_pyrometer(metadata: &FiestaMetadata, pyrometer_bin: &PathBuf
         }
     }
 }
+
+pub fn minimize_with_pyrometer(metadata: &FiestaMetadata, pyrometer_bin: &PathBuf, minimize_output_path: &PathBuf) -> (Child, u64) {
+    let minimize_output_path = minimize_output_path.join(format!("{}.sol", metadata.bytecode_hash));
+    let minimize_output_path_str = minimize_output_path.to_str().unwrap();
+    
+    // Create any necessary directories
+    if let Some(parent) = minimize_output_path.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+
+    match metadata.clone().source_type.unwrap() {
+        SourceType::SingleMain(_sol) => {
+            let path_to_file = PathBuf::from(metadata.abs_path_to_dir.clone()).join("main.sol");
+            let path_to_file = path_to_file.to_str().unwrap();
+            let size = fs::metadata(path_to_file).unwrap().len();
+
+            let child = Command::new(&pyrometer_bin)
+                .args([path_to_file, "--debug", "--debug-panic", "--minimize-debug", minimize_output_path_str])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("Failed to spawn process");
+
+            (child, size)
+        }
+        SourceType::Multiple(multiple_files) => {
+            let substr_to_find = format!("contract {} ", metadata.contract_name);
+            for (name, sol_string) in multiple_files {
+                if sol_string.contains(&substr_to_find) {
+                    let path_to_file = PathBuf::from(metadata.abs_path_to_dir.clone()).join(name);
+                    let path_to_file = path_to_file.to_str().unwrap();
+                    let size = fs::metadata(path_to_file).unwrap().len();
+
+                    let child = Command::new(&pyrometer_bin)
+                        .args([path_to_file, "--debug", "--debug-panic", "--minimize-debug", minimize_output_path_str])
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .expect("Failed to spawn process");
+
+                    return (child, size);
+                }
+            }
+            panic!(
+                "Could not find contract name {} in multiple_files",
+                metadata.contract_name
+            );
+        }
+        SourceType::EtherscanMetadata(_source_metadata) => {
+            let path_to_file =
+                PathBuf::from(metadata.abs_path_to_dir.clone()).join("contract.json");
+            let path_to_file = path_to_file.to_str().unwrap();
+            let size = fs::metadata(path_to_file).unwrap().len();
+            let child = Command::new(&pyrometer_bin)
+                .args([path_to_file, "--debug", "--debug-panic", "--minimize-debug", minimize_output_path_str])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("Failed to spawn process");
+
+            (child, size)
+        }
+    }
+}
+
 
 pub fn check_child_exit(child: Child) -> ExitType {
     // determine if the exit status has panics, errors, etc.
@@ -271,7 +336,7 @@ fn convert_pyrometer_output_to_exit_type(stdout_string: String, stderr_string: S
     ExitType::NonInterpreted(stdout_string, stderr_string)
 }
 
-pub fn display_result_distribution(distribution: HashMap<ExitType, usize>, total: usize, smallest_sources: HashMap<ExitType, ResultMessage>) {
+pub fn display_result_distribution(distribution: HashMap<ExitType, usize>, total: usize, smallest_sources: HashMap<ExitType, String>) {
     let mut table = Table::new();
     table.add_row(Row::new(vec![
         Cell::new("Result Type").style_spec("bFc"),
@@ -287,8 +352,7 @@ pub fn display_result_distribution(distribution: HashMap<ExitType, usize>, total
         let percentage_str = format!("{:.2}%", percentage);
 
         let smallest_source = smallest_sources.get(&result_type)
-            .map(|msg| get_path_str_for_result_message(&msg))
-            .unwrap_or_else(|| "N/A".to_string());
+            .unwrap_or(&"N/A".to_string()).clone();
         
         let result_type_str = result_type.to_string();
         let result_type_str_with_source = format!("{}\n{}", result_type_str, smallest_source);
@@ -309,7 +373,7 @@ pub fn display_result_distribution(distribution: HashMap<ExitType, usize>, total
     table.printstd();
 }
 
-fn get_path_str_for_result_message(result_message: &ResultMessage) -> String {
+pub fn get_path_str_for_result_message(result_message: &ResultMessage) -> String {
 
     let metadata = &result_message.metadata;
 

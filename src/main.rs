@@ -8,17 +8,17 @@ use std::time::Duration;
 use tokio::runtime::Runtime;
 use tokio::signal;
 use tokio::sync::{oneshot, Semaphore};
-
+use sysinfo::System;
 mod data_structures;
 mod utils;
 
 use data_structures::{ExitType, FiestaMetadata, ResultMessage, ResultsWriter, SourceType};
 use utils::{
-    analyze_with_pyrometer, check_child_exit, collect_fiesta_metadatas,
+    analyze_with_pyrometer, minimize_with_pyrometer, check_child_exit, collect_fiesta_metadatas,
     display_result_distribution, get_num_contracts, get_output_path, get_timeouts,
 };
 
-use crate::utils::build_pyrometer;
+use crate::utils::{build_pyrometer, get_path_str_for_result_message};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -54,7 +54,9 @@ pub struct Args {
     #[clap(long, short)]
     pub skip_contracts: Option<usize>,
 
-
+    /// Output path for minimized contracts. Recommended is `./tmp`
+    #[clap(long, value_name = "MINIMIZE_PATH")]
+    pub minimize_path: Option<String>,
 }
 
 fn main() {
@@ -114,14 +116,14 @@ fn main() {
         )
         .await
     });
-
+    let pyrometer_bin_clone = pyrometer_bin.clone();
     let tx_handle = handle.spawn(async move {
         tx_loop(
             fiesta_metadatas,
             tx,
             stop_tx,
             jobs.into(),
-            &pyrometer_bin,
+            &pyrometer_bin_clone,
             pyrometer_timeout,
             early_exit_clone_tx,
         )
@@ -133,11 +135,89 @@ fn main() {
 
     // Shut down the runtime
     drop(handle);
+
+    // Potentially minimize the smallest source contracts
+    if let Some(minimize_path) = args.minimize_path {
+        println!("⏹️ Minimizing contracts...");
+        let mut smallest_fiesta_metadatas = vec![];
+        if let Ok(ref result_distribution) = rx_result {
+
+            for result_message in result_distribution.2.values() {
+                smallest_fiesta_metadatas.push(result_message.metadata.clone());
+            }
+        }
+        let early_exit = Arc::new(AtomicBool::new(false));
+        let early_exit_clone_rx = early_exit.clone();
+        let early_exit_clone_tx = early_exit.clone();
+
+        let (tx, rx) = mpsc::channel();
+        let (stop_tx, stop_rx) = oneshot::channel::<()>();
+
+        let handle = runtime.handle().clone();
+
+        let smallest_contracts_len = smallest_fiesta_metadatas.len();
+        let rx_handle = handle.spawn(async move {
+            minimize_rx_loop(
+                rx,
+                stop_rx,
+                rx_loop_timeout,
+                smallest_contracts_len,
+                early_exit_clone_rx,
+            )
+            .await
+        });
+
+        let minimize_path_clone = minimize_path.clone();
+        let tx_handle = handle.spawn(async move {
+            minimize_tx_loop(
+                smallest_fiesta_metadatas,
+                tx,
+                stop_tx,
+                jobs.into(),
+                &pyrometer_bin,
+                pyrometer_timeout,
+                early_exit_clone_tx,
+                minimize_path_clone.into(),
+            )
+            .await
+        });
+
+        // Wait for both tasks to complete
+        let (_, _) = runtime.block_on(async { tokio::join!(rx_handle, tx_handle) });
+        // Shut down the runtime
+        drop(handle);
+        // We don't care about minimized_rx_result, we only want to replace the smallest_source path with the minimized one (if it was successful)
+        if let Ok(result_distribution) = rx_result {
+            let smallest_sources: HashMap<ExitType, String> = result_distribution.2.iter()
+                .map(|(exit_type, result_message)| {
+                    let original_path = get_path_str_for_result_message(result_message);
+                    let minimized_path = format!("{}/{}.sol", minimize_path, result_message.metadata.bytecode_hash);
+                    let final_path = if std::path::Path::new(&minimized_path).exists() {
+                        minimized_path
+                    } else {
+                        original_path
+                    };
+                    (exit_type.clone(), final_path)
+                })
+                .collect();
+
+            display_result_distribution(result_distribution.0, result_distribution.1, smallest_sources);
+        }
+    } else {
+        // If we're not minimizing, we can just display the result distribution as is
+        if let Ok(result_distribution) = rx_result {
+            let smallest_sources: HashMap<ExitType, String> = result_distribution.2.iter()
+                .map(|(exit_type, result_message)| (exit_type.clone(), get_path_str_for_result_message(result_message)))
+                .collect();
+
+            display_result_distribution(result_distribution.0, result_distribution.1, smallest_sources);
+        }
+    }
+
     runtime.shutdown_timeout(Duration::from_secs(2));
 
-    if let Ok(result_distribution) = rx_result {
-        display_result_distribution(result_distribution.0, result_distribution.1, result_distribution.2);
-    }
+    // Call cleanup function to kill any ongoing pyrometer processes. TODO: live server mode would be killed by this
+    cleanup();
 }
 
 pub async fn tx_loop(
@@ -311,4 +391,136 @@ pub async fn rx_loop(
         }
     }
     (result_distribution, total_parsable, smallest_results)
+}
+
+/// A trimmed down version of tx_loop that is only used to run pyrometer to minimize a few contracts
+pub async fn minimize_tx_loop(
+    fiesta_metadatas: Vec<FiestaMetadata>,
+    tx_result: mpsc::Sender<ResultMessage>,
+    tx_stop: oneshot::Sender<()>,
+    max_concurrent_processes: usize,
+    pyrometer_bin: &PathBuf,
+    pyrometer_timeout: f64,
+    early_exit: Arc<AtomicBool>,
+    contract_minimize_output_path: PathBuf,
+) {
+    let semaphore = Arc::new(Semaphore::new(max_concurrent_processes));
+    let pyrometer_timeout_duration = Duration::from_secs_f64(pyrometer_timeout);
+    let mut join_handles = Vec::new();
+
+    for metadata in fiesta_metadatas {
+        if early_exit.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let tx = tx_result.clone();
+        let semaphore = semaphore.clone();
+        let permit = semaphore.acquire_owned().await;
+        let pyrometer_bin_clone = pyrometer_bin.clone();
+        let contract_minimize_output_path_clone = contract_minimize_output_path.clone();
+        let join_handle = tokio::spawn(async move {
+            let (mut child, size) = minimize_with_pyrometer(&metadata, &pyrometer_bin_clone, &contract_minimize_output_path_clone);
+
+            let start_time = std::time::Instant::now();
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_status)) => {
+                        let result_message = ResultMessage {
+                            metadata: metadata.clone(),
+                            child: Some(child),
+                            time: start_time.elapsed().as_secs_f64(),
+                            size,
+                        };
+                        let _ = tx.send(result_message);
+                        break;
+                    }
+                    Ok(None) => {
+                        if start_time.elapsed() > pyrometer_timeout_duration {
+                            let _ = child.kill();
+                            let result_message = ResultMessage {
+                                metadata: metadata.clone(),
+                                child: None,
+                                time: pyrometer_timeout,
+                                size,
+                            };
+                            let _ = tx.send(result_message);
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                    Err(e) => {
+                        println!("Error while polling child process: {:?}", e);
+                        break;
+                    }
+                }
+            }
+
+            drop(permit);
+        });
+
+        join_handles.push(join_handle);
+    }
+
+    for handle in join_handles {
+        let _ = handle.await;
+    }
+
+    let _ = tx_stop.send(());
+}
+
+/// A trimmed down version of rx_loop that is only used to run pyrometer to minimize a few contracts
+pub async fn minimize_rx_loop(
+    rx_result: mpsc::Receiver<ResultMessage>,
+    mut rx_stop: oneshot::Receiver<()>,
+    rx_loop_timeout: f64,
+    total_contracts: usize,
+    early_exit: Arc<AtomicBool>,
+) {
+    let rx_loop_timeout = Duration::from_secs_f64(rx_loop_timeout);
+
+    let pb = ProgressBar::new(total_contracts as u64);
+    pb.set_style(ProgressStyle::default_bar()
+        .template("{spinner:.green} [{elapsed_precise:.minutes()}] (Time left: {eta}) [{bar:.cyan/blue}] {pos}/{len}")
+        .unwrap()
+        .progress_chars("#>-"));
+
+    loop {
+        if early_exit.load(Ordering::Relaxed) {
+            break;
+        }
+
+        match rx_stop.try_recv() {
+            Ok(_) => {
+                break;
+            }
+            Err(_) => match rx_result.recv_timeout(rx_loop_timeout) {
+                Ok(_result_message) => {
+                    pb.inc(1);
+                }
+                Err(e) => match e {
+                    mpsc::RecvTimeoutError::Timeout => {
+                        println!("Timeout hit, quitting rx_loop");
+                        break;
+                    }
+                    _ => {
+                        println!("Error receiving from rx_result: {:?}", e);
+                    }
+                },
+            },
+        }
+    }
+}
+
+fn cleanup() {
+    let mut system = System::new_all();
+    system.refresh_all();
+
+    for (pid, process) in system.processes() {
+        if process.name() == "pyrometer" {
+            println!("🔪 Killing hanging pyrometer process: {:?}", process);
+            if !process.kill() {
+                eprintln!("Failed to kill process {}", pid);
+            }
+        }
+    }
 }
